@@ -1,0 +1,26 @@
+# Build artifacts
+control/accept-control
+treatment/accept-treat
+treatment/*.o
+*.bin
+
+# Benchmark outputs / run state
+results/*.jsonl
+results/*/
+results/BEST.json
+results/CONTROL_BASELINE.md
+results/ENV_BASELINE.sha
+
+# graphify code-map (the optimizer reads GRAPH_REPORT.md; the raw graph is large)
+graphify-out/graph.json
+graphify-out/graph.html
+graphify-out/cache/
+
+# Local tooling / secrets (none committed; guard against accidents)
+harness/mcp-clickhouse.json
+*.env
+.env
+
+# OS / editor
+.DS_Store
+*.swp
