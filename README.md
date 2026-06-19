@@ -1,4 +1,4 @@
-<h1 align="center">flashaccept</h1>
+<p align="center"><img src="docs/banner.png" alt="flashaccept" width="100%"></p>
 
 <p align="center">
   <b>A fast io_uring TCP accept engine for Linux.</b><br>
