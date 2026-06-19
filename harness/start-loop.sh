@@ -25,9 +25,9 @@ clickhouse-client --query "SELECT 1" >/dev/null 2>&1 || clickhouse start >/dev/n
 # profile -> per-step windows
 case "${PROFILE:-fast}" in
   full) envline=(MAX_ITERS="${MAX_ITERS:-1000000}") ;;
+  # fast = short windows but keep N=5 (the user-required average of 5 load tests); adaptive ramp.
   fast|*) envline=(MAX_ITERS="${MAX_ITERS:-1000000}" WARMUP_OVERRIDE="${WARMUP_OVERRIDE:-3}" \
-          MEASURE_OVERRIDE="${MEASURE_OVERRIDE:-8}" N_OVERRIDE="${N_OVERRIDE:-2}" \
-          RAMP_OVERRIDE="${RAMP_OVERRIDE:-harness/ramp.dev.conf}") ;;
+          MEASURE_OVERRIDE="${MEASURE_OVERRIDE:-6}") ;;
 esac
 
 nohup env "${envline[@]}" harness/loop.sh > "$OUT" 2>&1 &

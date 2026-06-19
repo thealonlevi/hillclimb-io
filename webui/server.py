@@ -96,7 +96,10 @@ def api_state():
     its = iterations()
     promotes = sum(1 for r in its if r.get("verdict") == "promote")
     reverts = sum(1 for r in its if str(r.get("verdict", "")).startswith("revert"))
-    tokens = sum(int(r.get("in_tokens", 0) or 0) for r in its)
+    def _i(x):
+        try: return int(float(x or 0))
+        except Exception: return 0
+    tokens = sum(_i(r.get("in_tokens", 0)) for r in its)
     cum = its[-1]["cum_cost_usd"] if its else "0"
     runs = ch(f"SELECT arm, round(score,1) AS score, max_sustained_conn_s AS conn_s, "
               f"round(sysc_io_uring_enter,2) AS enter_pc, round(sysc_accept4,2) AS accept_pc, "
@@ -267,6 +270,10 @@ function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':
 tick();setInterval(tick,4000);
 </script></body></html>"""
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True        # don't let a stuck handler thread block shutdown
+    request_queue_size = 128     # bigger accept backlog so a slow CH query can't wedge the listener
+
 if __name__ == "__main__":
     print(f"accept-bench web UI on http://0.0.0.0:{PORT}  (repo={REPO})", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
+    Server(("0.0.0.0", PORT), H).serve_forever()
