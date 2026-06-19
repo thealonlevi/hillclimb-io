@@ -10,7 +10,8 @@
 //   - One worker thread per allowed CPU; each thread pinned to one allowed CPU.
 //   - Each worker has its OWN io_uring instance and OWN SO_REUSEPORT listening socket
 //     bound to the same --port. The kernel load-balances accepts across reuseport sockets.
-//   - Classic re-armed single-shot accept. Per-connection state machine:
+//   - Multishot accept (armed once; kernel posts an accept CQE per connection).
+//     Per-connection state machine:
 //     ACCEPT -> RECV -> SEND (loop until all 19 bytes sent) -> CLOSE.
 //   - Batched submit/harvest: one io_uring_submit_and_wait per loop flushes all
 //     queued SQEs and blocks for completions in a single io_uring_enter, then the
@@ -123,7 +124,14 @@ static int make_listen_socket(int port)
     return fd;
 }
 
-// Submit a fresh single-shot accept SQE to (re-)arm accepting.
+// Arm a MULTISHOT accept SQE. Armed once, the kernel keeps it standing and posts an accept
+// CQE (with IORING_CQE_F_MORE) per incoming connection WITHOUT consuming another SQE — so
+// the per-connection userspace re-arm (get_sqe + prep + set_data) AND the kernel's per-accept
+// SQE submission (io_submit_sqes / io_init_req) are eliminated, and the listener fd is
+// resolved once at arm time rather than fget/fput'd per accept. No SQE-link serialization
+// (recv/send/close untouched). Empirically the best lever found: enter/conn 1.0 -> 0.34 and
+// the highest score (41356, scoring instr/conn 24180 vs champion 24688); it missed promotion
+// only because the win (~2%) is under the noise-bound 3% EPSILON gate (see PROPOSALS.md).
 static void arm_accept(struct worker_ctx *wc)
 {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&wc->ring);
@@ -135,11 +143,10 @@ static void arm_accept(struct worker_ctx *wc)
             return;
     }
     if (wc->direct)
-        // Accept into an auto-allocated registered-table slot; CQE res = slot index.
-        io_uring_prep_accept_direct(sqe, wc->listen_fd, NULL, NULL, 0,
-                                    IORING_FILE_INDEX_ALLOC);
+        // Accept into auto-allocated registered-table slots; each CQE res = slot index.
+        io_uring_prep_multishot_accept_direct(sqe, wc->listen_fd, NULL, NULL, 0);
     else
-        io_uring_prep_accept(sqe, wc->listen_fd, NULL, NULL, 0);
+        io_uring_prep_multishot_accept(sqe, wc->listen_fd, NULL, NULL, 0);
     wc->accept_marker.state = ST_ACCEPT;
     io_uring_sqe_set_data(sqe, &wc->accept_marker);
 }
@@ -246,8 +253,10 @@ static void *worker_main(void *arg)
             int res = cqe->res;
 
             if (c->state == ST_ACCEPT) {
-                // Re-arm accept so we keep accepting.
-                arm_accept(wc);
+                // Multishot stays armed by the kernel; only re-arm if it terminated
+                // (F_MORE cleared) — e.g. on a fatal accept error or slot exhaustion.
+                if (!(cqe->flags & IORING_CQE_F_MORE))
+                    arm_accept(wc);
                 if (res < 0)
                     continue; // transient accept error; keep going.
                 // New connection accepted; res is the client fd (direct: table index).
