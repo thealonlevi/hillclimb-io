@@ -77,3 +77,15 @@ CREATE TABLE IF NOT EXISTS acceptbench.iterations (
   in_tokens    UInt64,
   hypothesis   String
 ) ENGINE = MergeTree ORDER BY (ts);
+
+-- function-level CPU profile: the hottest symbols per run (where the cycles actually go).
+-- category ∈ kernel | user | liburing | libc | other. self_pct = % of CPU samples in that symbol.
+CREATE TABLE IF NOT EXISTS acceptbench.profile (
+  ts        DateTime,
+  runid     String,
+  rank      UInt16,
+  symbol    String,
+  module    String,
+  category  LowCardinality(String),
+  self_pct  Float64
+) ENGINE = MergeTree ORDER BY (runid, rank);

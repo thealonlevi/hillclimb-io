@@ -107,9 +107,18 @@ def api_state():
               f"round(sysc_io_uring_enter,3) AS enter_pc, round(perf_instr_pc,0) AS instr_pc, "
               f"round(perf_ipc,3) AS ipc, round(spread_pct,1) AS spread FROM {CH_DB}.runs "
               f"WHERE arm='treatment' AND gate_passed=1 ORDER BY ts ASC LIMIT 500")
+    split = ch(f"SELECT round(cpu_kernel_pct,1) AS kernel, round(cpu_user_pct,1) AS user, "
+               f"round(cpu_liburing_pct,1) AS liburing, runid FROM {CH_DB}.runs "
+               f"WHERE arm='treatment' AND cpu_kernel_pct>0 ORDER BY ts DESC LIMIT 1")
+    hot = []
+    if split:
+        hot = ch(f"SELECT rank, category, round(self_pct,2) AS pct, symbol FROM {CH_DB}.profile "
+                 f"WHERE runid='{split[0]['runid']}' ORDER BY rank LIMIT 14")
     return {
         "now": time.strftime("%Y-%m-%d %H:%M:%S"),
         "loop": loop_state(),
+        "cpu_split": split[0] if split else None,
+        "hot_functions": hot,
         "champion": read_json(BEST, {}),
         "control_baseline": read_json(CTRL, {}).get("score"),
         "totals": {"iterations": len(its), "promotes": promotes, "reverts": reverts,
@@ -175,6 +184,9 @@ small{color:var(--mut)}
  <div class=panel><h2>cumulative cost ($)</h2><canvas id=cCost height=120></canvas></div>
  <div class=panel><h2>IPC (instructions per cycle)</h2><canvas id=cIpc height=120></canvas></div>
 </div>
+<div class=panel><h2>where the CPU goes (function-level profile of the champion)</h2>
+ <div id=cpusplit style="margin-bottom:8px"></div>
+ <div style="max-height:300px;overflow:auto"><table id=hot></table></div></div>
 <div class=panel><h2>recent runs</h2><div style=overflow-x:auto><table id=runs></table></div></div>
 <div class=grid2>
  <div class=panel><h2>mutation log (what the agent tried)</h2><div style="max-height:240px;overflow:auto"><table id=muts></table></div></div>
@@ -227,6 +239,20 @@ async function tick(){
  mkLine('cCost',labs,[{label:'cum $',data:its.map(r=>+r.cum_cost_usd),borderColor:C.grn,fill:true,backgroundColor:'rgba(63,185,80,.08)',pointRadius:0}]);
  mkLine('cConn',tr.map((_,i)=>i+1),[{label:'conn/s',data:tr.map(r=>+r.conn_s),borderColor:C.blu,backgroundColor:'transparent',pointRadius:2,tension:.2}]);
  mkLine('cIpc',tr.map((_,i)=>i+1),[{label:'IPC',data:tr.map(r=>+r.ipc),borderColor:C.grn,backgroundColor:'transparent',pointRadius:2,tension:.2}]);
+ // cpu split + hot functions
+ const sp=s.cpu_split;
+ if(sp){
+   const k=+sp.kernel,u=+sp.user,lu=+sp.liburing,other=Math.max(0,100-k-u-lu);
+   document.getElementById('cpusplit').innerHTML=
+     `<div style="display:flex;height:22px;border-radius:5px;overflow:hidden;font-size:11px;line-height:22px;text-align:center">`+
+     `<div style="width:${k}%;background:#f85149" title="kernel">${k>8?'kernel '+k+'%':''}</div>`+
+     `<div style="width:${lu}%;background:#d29922" title="liburing">${lu>8?'liburing '+lu+'%':''}</div>`+
+     `<div style="width:${u}%;background:#58a6ff" title="user">${u>8?'user '+u+'%':''}</div>`+
+     `<div style="width:${other}%;background:#3fb950" title="other">${other>8?'other '+other+'%':''}</div></div>`+
+     `<small>kernel ${k}% · liburing ${lu}% · user(arm code) ${u}% · other ${other}% — almost all CPU is kernel TCP/netstack, not the arm's code</small>`;
+ }
+ document.getElementById('hot').innerHTML='<tr><th>#</th><th>cat</th><th>self%</th><th>symbol</th></tr>'+
+  (s.hot_functions||[]).map(h=>`<tr><td>${h.rank}</td><td class="t-${h.category=='kernel'?'control-frozen':'treatment'}">${h.category}</td><td>${h.pct}</td><td><code>${esc(h.symbol)}</code></td></tr>`).join('');
  // runs table
  document.getElementById('runs').innerHTML='<tr><th>time</th><th>arm</th><th>score</th><th>conn/s</th><th>io_uring_enter/c</th><th>accept4/c</th><th>drop</th><th>ceiling</th></tr>'+
   (s.runs||[]).map(r=>`<tr><td><small>${(r.ts||'').slice(5,19)}</small></td><td class="t-${r.arm}">${r.arm}</td><td>${r.score}</td><td>${r.conn_s}</td><td>${r.enter_pc}</td><td>${r.accept_pc}</td><td>${r.drop}</td><td>${r.ceiling}</td></tr>`).join('');

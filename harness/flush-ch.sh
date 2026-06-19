@@ -17,7 +17,7 @@ total=$(wc -l < "$HISTORY")
 HIST="$HISTORY" START="$last" CHDB="$CH_DB" python3 <<'PY'
 import os, json, subprocess, datetime
 hist=os.environ["HIST"]; start=int(os.environ["START"]); db=os.environ["CHDB"]
-rows=[]; steprows=[]
+rows=[]; steprows=[]; profrows=[]
 for i,line in enumerate(open(hist),1):
     if i<=start: continue
     line=line.strip()
@@ -25,6 +25,7 @@ for i,line in enumerate(open(hist),1):
     try: r=json.loads(line)
     except Exception: continue
     sp=r.get("syscall_profile") or {}; g=r.get("gate") or {}; pf=r.get("perf") or {}
+    fp=r.get("func_profile") or {}
     ts=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"); runid=r.get("runid","")
     rows.append({
         "ts": ts, "runid": runid, "arm": r.get("arm",""),
@@ -39,6 +40,8 @@ for i,line in enumerate(open(hist),1):
         "sysc_read": sp.get("read",0), "sysc_write": sp.get("write",0),
         "sysc_close": sp.get("close",0), "sysc_epoll_wait": sp.get("epoll_wait",0),
         "perf_ipc": float(pf.get("ipc",0) or 0), "perf_instr_pc": float(pf.get("instr_pc",0) or 0),
+        "cpu_kernel_pct": float(fp.get("kernel_pct",0) or 0), "cpu_user_pct": float(fp.get("user_pct",0) or 0),
+        "cpu_liburing_pct": float(fp.get("liburing_pct",0) or 0),
         "perf_llc_miss_pc":0,"perf_ctxsw_pc":0,
         "kernel":"", "env_fingerprint": r.get("env_fingerprint",""),
         "input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":0,
@@ -52,6 +55,13 @@ for i,line in enumerate(open(hist),1):
             "max_recvq": int(s.get("max_recvq",0)), "p50_accept_ms": 0.0,
             "p99_accept_ms": float(s.get("p99_ms",0)), "is_ceiling": 0,
         })
+    # function-level profile rows -> profile table (top hot symbols)
+    for rank,t in enumerate(fp.get("top") or [], 1):
+        profrows.append({
+            "ts": ts, "runid": runid, "rank": rank, "symbol": t.get("sym",""),
+            "module": t.get("module",""), "category": t.get("cat","other"),
+            "self_pct": float(t.get("pct",0)),
+        })
 if not rows:
     raise SystemExit(0)
 def insert(table, data):
@@ -61,7 +71,7 @@ def insert(table, data):
     if p.returncode!=0:
         import sys; sys.stderr.write(f"[flush-ch] {table} insert failed: "+p.stderr[:300]+"\n"); raise SystemExit(1)
     return len(data)
-n=insert("runs", rows); insert("steps", steprows)
+n=insert("runs", rows); insert("steps", steprows); insert("profile", profrows)
 print(n)
 PY
 rc=$?

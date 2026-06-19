@@ -163,15 +163,50 @@ open(e["OUT"],"w").write('{"ipc":%.3f,"instr_pc":%.0f}'%((ins/cyc if cyc else 0)
 PY
 }
 
+# function-level CPU profile: WHERE the cycles go. Uses cpu-clock software sampling (no hardware
+# PMU needed). Writes category split (kernel/user/liburing/libc %) + top symbols. This is what
+# reveals that ~all CPU is kernel-side TCP/netstack, not the arm's own code.
+profile_functions(){   # writes {kernel_pct,user_pct,liburing_pct,libc_pct,top:[...]} to $1
+  local out="$1"
+  command -v perf >/dev/null || { echo '{}' > "$out"; return; }
+  perf record -e cpu-clock -F 997 -p "$ARM_PID" -o "$RUNDIR/perf-fn.data" -- sleep 4 2>/dev/null &
+  local rp=$!
+  loadgen_run 40000 4 "${LG_THREADS:-10}" 0 >/dev/null 2>&1
+  wait "$rp" 2>/dev/null
+  perf report -i "$RUNDIR/perf-fn.data" --stdio --percent-limit 0.1 2>/dev/null > "$RUNDIR/perf-fn.txt" || true
+  ARM_COMM="$(basename "$BIN")" FN="$RUNDIR/perf-fn.txt" OUT="$out" python3 <<'PY'
+import os,re,json
+e=os.environ
+try: txt=open(e["FN"]).read()
+except Exception: txt=""
+comm=e.get("ARM_COMM","")
+rx=re.compile(r'^\s*([\d.]+)%\s+(\S+)\s+(\S+)\s+\[([k.])\]\s+(.+?)\s*$')
+top=[]; cat={"kernel":0.0,"user":0.0,"liburing":0.0,"libc":0.0,"other":0.0}
+for ln in txt.splitlines():
+    m=rx.match(ln)
+    if not m: continue
+    pct=float(m.group(1)); dso=m.group(3); kd=m.group(4); sym=m.group(5)
+    if kd=='k' or 'kernel' in dso: c='kernel'
+    elif 'liburing' in dso: c='liburing'
+    elif 'libc' in dso or 'ld-' in dso: c='libc'
+    elif comm in dso: c='user'
+    else: c='other'
+    cat[c]=cat.get(c,0)+pct
+    if len(top)<25: top.append({"sym":sym[:80],"module":dso[:40],"pct":pct,"cat":c})
+open(e["OUT"],"w").write(json.dumps({"kernel_pct":round(cat["kernel"],2),"user_pct":round(cat["user"],2),
+  "liburing_pct":round(cat["liburing"],2),"libc_pct":round(cat["libc"],2),"top":top}))
+PY
+}
+
 # ---- 5. record ------------------------------------------------------------
 # reads per-step / syscall JSON from files (robust — never pass big JSON via argv)
-record_score(){   # score max_sustained reason [stepfile] [syscfile] [perffile] [spread]
-  local score="$1" mx="$2" reason="$3" stepfile="${4:-}" syscfile="${5:-}" perffile="${6:-}" spread="${7:-0}"
+record_score(){   # score max_sustained reason [stepfile] [syscfile] [perffile] [spread] [funcfile]
+  local score="$1" mx="$2" reason="$3" stepfile="${4:-}" syscfile="${5:-}" perffile="${6:-}" spread="${7:-0}" funcfile="${8:-}"
   CFG_HASH=""
   [ "$ARM" = treatment ] && CFG_HASH="$(git rev-parse HEAD 2>/dev/null || echo '')"
   RUNID="$RUNID" ARM="$ARM" SCORE="$score" MX="$mx" CORES="$CORES" REASON="$reason" SPREAD="$spread" \
-  ENVFP="$ENVFP" STEPFILE="$stepfile" SYSCFILE="$syscfile" PERFFILE="$perffile" NREPS="${N:-1}" \
-  HIST="$HISTORY" CFG_HASH="$CFG_HASH" \
+  ENVFP="$ENVFP" STEPFILE="$stepfile" SYSCFILE="$syscfile" PERFFILE="$perffile" FUNCFILE="$funcfile" \
+  NREPS="${N:-1}" HIST="$HISTORY" CFG_HASH="$CFG_HASH" \
   python3 <<'PY'
 import os,json
 def loadsteps(p):
@@ -187,7 +222,7 @@ row=dict(runid=e["RUNID"],arm=e["ARM"],config_hash=e["CFG_HASH"] or None,
          ceiling_reason=e["REASON"],env_fingerprint=e["ENVFP"],
          spread_pct=float(e["SPREAD"]),median_of=int(e["NREPS"]),
          per_step=loadsteps(e["STEPFILE"]),syscall_profile=loadjson(e["SYSCFILE"]),
-         perf=loadjson(e["PERFFILE"]))
+         perf=loadjson(e["PERFFILE"]),func_profile=loadjson(e["FUNCFILE"]))
 open(e["HIST"],"a").write(json.dumps(row)+"\n")
 print(json.dumps(row))
 PY
@@ -209,7 +244,7 @@ for rep in $(seq 1 "$N"); do
   log "rep $rep/$N ramping…"
   read -r mx REASON < <(run_ramp "$RUNDIR/steps.$rep.jsonl")
   SCORES+=( "$mx" )
-  if [ "$rep" -eq 1 ]; then profile_syscalls "$RUNDIR/syscall.json"; perf_pass "$RUNDIR/perf.json"; fi
+  if [ "$rep" -eq 1 ]; then profile_syscalls "$RUNDIR/syscall.json"; perf_pass "$RUNDIR/perf.json"; profile_functions "$RUNDIR/funcprof.json"; fi
   stop_arm; sleep "$SETTLE"; sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 done
 # median of reps
@@ -217,4 +252,4 @@ MEDIAN=$(printf '%s\n' "${SCORES[@]}" | sort -n | awk '{a[NR]=$1}END{print (NR%2
 SCORE=$(awk -v m="$MEDIAN" -v c="$CORES" 'BEGIN{printf "%.2f", m/c}')
 SPREAD=$(printf '%s\n' "${SCORES[@]}" | sort -n | awk '{a[NR]=$1}END{if(a[1]>0)printf "%.1f",(a[NR]-a[1])/a[1]*100; else print 0}')
 log "reps=${SCORES[*]} median_conn_s=$MEDIAN score=$SCORE spread=${SPREAD}% ceiling=$REASON"
-record_score "$SCORE" "$MEDIAN" "$REASON" "$RUNDIR/steps.1.jsonl" "$RUNDIR/syscall.json" "$RUNDIR/perf.json" "$SPREAD"
+record_score "$SCORE" "$MEDIAN" "$REASON" "$RUNDIR/steps.1.jsonl" "$RUNDIR/syscall.json" "$RUNDIR/perf.json" "$SPREAD" "$RUNDIR/funcprof.json"
