@@ -290,32 +290,38 @@ if ! build_arm; then
 fi
 ENVFP="$(env_fingerprint)"
 log "built $BIN ; env=$ENVFP ; runid=$RUNID"
-# OBJECTIVE = CPU efficiency: connections served per core-second = conn_s / (cpu_util * CORES).
-# This is the "conn/s vs CPU usage ratio" — exactly riptide's question (accept conns with less CPU).
-# We measure each arm at its adaptive ceiling, N reps, and report the MEAN (averaging kills noise).
-declare -a CONNS=() CPUS=()
+# OBJECTIVE = minimize CPU work per accepted connection. SCORE = 1e9 / instr_per_conn (higher is
+# better, so the keep/revert logic is unchanged). instr_per_conn = CPU instructions per connection
+# (perf exact counter): clean even at low CPU, frequency-independent, directly riptide's question.
+# Measured at each rep's adaptive ceiling, averaged over N reps. conn/s + conn/core-sec recorded too.
+declare -a CONNS=() CPUS=() INSTR=()
 REASON="none"
 for rep in $(seq 1 "$N"); do
   start_arm
   if ! smoke; then log "SMOKE FAILED (rep $rep) — score 0"; stop_arm; record_score 0 0 smoke_fail >/dev/null; echo '{"score":0,"reason":"smoke_fail"}'; exit 0; fi
   log "rep $rep/$N ramping…"
   read -r mx REASON bcpu < <(run_ramp "$RUNDIR/steps.$rep.jsonl" "$([ "$rep" -eq 1 ] && echo 1 || echo 0)")
-  CONNS+=( "${mx:-0}" ); CPUS+=( "${bcpu:-0}" )
-  log "  rep $rep: conn_s=${mx:-0} cpu@ceiling=${bcpu:-0}"
-  if [ "$rep" -eq 1 ]; then profile_syscalls "$RUNDIR/syscall.json"; perf_pass "$RUNDIR/perf.json"; profile_functions "$RUNDIR/funcprof.json"; fi
+  perf_pass "$RUNDIR/perf.$rep.json"   # instr/conn at this rep's ceiling concurrency
+  ipc=$(python3 -c "import json;print(json.load(open('$RUNDIR/perf.$rep.json')).get('instr_pc',0))" 2>/dev/null || echo 0)
+  CONNS+=( "${mx:-0}" ); CPUS+=( "${bcpu:-0}" ); INSTR+=( "${ipc:-0}" )
+  log "  rep $rep: conn_s=${mx:-0} cpu@ceiling=${bcpu:-0} instr/conn=${ipc:-0}"
+  if [ "$rep" -eq 1 ]; then profile_syscalls "$RUNDIR/syscall.json"; cp "$RUNDIR/perf.$rep.json" "$RUNDIR/perf.json"; profile_functions "$RUNDIR/funcprof.json"; fi
   stop_arm; sleep "$SETTLE"; sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 done
-# mean conn/s, mean cpu, and the efficiency ratio (+ its run-to-run spread)
-read -r MEAN_CONN MEAN_CPU SCORE SPREAD < <(python3 - "$CORES" "${CONNS[*]}" "${CPUS[*]}" <<'PY'
+# averages: score = 1e9/mean(instr_per_conn); also mean conn/s, conn/core-sec, and instr spread
+read -r MEAN_CONN MEAN_CPU MEAN_INSTR SCORE EFF SPREAD < <(python3 - "$CORES" "${CONNS[*]}" "${CPUS[*]}" "${INSTR[*]}" <<'PY'
 import sys
-cores=float(sys.argv[1]); conns=[float(x) for x in sys.argv[2].split()]; cpus=[float(x) for x in sys.argv[3].split()]
+cores=float(sys.argv[1])
+conns=[float(x) for x in sys.argv[2].split()]; cpus=[float(x) for x in sys.argv[3].split()]
+instr=[float(x) for x in sys.argv[4].split() if float(x)>0]
 mc=sum(conns)/len(conns) if conns else 0
-mu=max(sum(cpus)/len(cpus) if cpus else 0, 0.005)        # floor cpu to avoid div blow-up
-eff=mc/(mu*cores) if mu>0 else 0                          # connections per core-second
-efs=[c/(max(u,0.005)*cores) for c,u in zip(conns,cpus)]  # per-rep efficiency for spread
-spread=(max(efs)-min(efs))/min(efs)*100 if efs and min(efs)>0 else 0
-print("%.0f %.4f %.1f %.1f"%(mc,mu,eff,spread))
+mu=max(sum(cpus)/len(cpus) if cpus else 0,0.005)
+mi=sum(instr)/len(instr) if instr else 0
+score=1e9/mi if mi>0 else 0                                # higher = fewer instr/conn = better
+eff=mc/(mu*cores) if mu>0 else 0                           # conn per core-second (reference)
+spread=(max(instr)-min(instr))/min(instr)*100 if len(instr)>1 and min(instr)>0 else 0
+print("%.0f %.4f %.0f %.1f %.1f %.1f"%(mc,mu,mi,score,eff,spread))
 PY
 )
-log "reps_conn=${CONNS[*]} reps_cpu=${CPUS[*]} | mean_conn=$MEAN_CONN mean_cpu=$MEAN_CPU EFF(conn/core-s)=$SCORE spread=${SPREAD}% ceiling=$REASON"
+log "reps_conn=${CONNS[*]} reps_instr=${INSTR[*]} | mean_conn=$MEAN_CONN mean_instr/conn=$MEAN_INSTR SCORE(1e9/instr)=$SCORE conn/core-s=$EFF instr_spread=${SPREAD}% ceiling=$REASON"
 CEIL_CPU="$MEAN_CPU" record_score "$SCORE" "$MEAN_CONN" "$REASON" "$RUNDIR/steps.1.jsonl" "$RUNDIR/syscall.json" "$RUNDIR/perf.json" "$SPREAD" "$RUNDIR/funcprof.json"
