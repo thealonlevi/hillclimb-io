@@ -12,9 +12,18 @@ Endpoints:
 
 Stdlib only. Start with scripts/setup-loadgen.sh (or: python3 loadgen/loadgen-server.py).
 """
-import json, os, subprocess, shlex
+import json, os, subprocess, shlex, resource
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+# raise the open-fd limit so spawned loadgen subprocesses inherit it (high-latency links need many
+# concurrent connections; default 1024 -> socket() EMFILE). Belt-and-suspenders with loadgen.c.
+try:
+    resource.setrlimit(resource.RLIMIT_NOFILE, (1048576, 1048576))
+except Exception:
+    try:
+        h = resource.getrlimit(resource.RLIMIT_NOFILE)[1]; resource.setrlimit(resource.RLIMIT_NOFILE, (h, h))
+    except Exception: pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOADGEN = os.path.join(HERE, "loadgen")

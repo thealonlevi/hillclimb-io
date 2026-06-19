@@ -9,4 +9,6 @@ base=/sys/fs/cgroup/"$cg"
 [ -d "$base" ] || { echo "cgrun: cgroup $cg does not exist ($base)" >&2; exit 1; }
 # Put *this* shell into the target cgroup, then exec the command so it inherits membership.
 echo $$ > "$base/cgroup.procs"
+# raise open-fd limit so the arm can hold many concurrent connections (high-latency loadgen path)
+ulimit -n 1048576 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 exec "$@"

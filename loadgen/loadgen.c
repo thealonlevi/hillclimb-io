@@ -25,6 +25,7 @@
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 
 static const char REPLY[]   = "HTTP/1.1 200 OK\r\n\r\n";  // 19 bytes, byte-for-byte
 static const int  REPLY_LEN = 19;
@@ -184,6 +185,11 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--sample-pct")&&i+1<argc) sample=atoi(argv[++i]);
     }
     if(threads<1)threads=1;
+    // raise the open-fd limit: high-latency links need many concurrent connections in flight
+    // (throughput = concurrency / latency); the default 1024 causes socket() EMFILE storms.
+    { struct rlimit rl; rl.rlim_cur=rl.rlim_max=1048576;
+      if(setrlimit(RLIMIT_NOFILE,&rl)!=0 && getrlimit(RLIMIT_NOFILE,&rl)==0){
+        rl.rlim_cur=rl.rlim_max; setrlimit(RLIMIT_NOFILE,&rl); } }
     memset(&g_addr,0,sizeof g_addr);
     g_addr.sin_family=AF_INET; g_addr.sin_port=htons(port);
     if(inet_pton(AF_INET,host,&g_addr.sin_addr)!=1){ fprintf(stderr,"bad host %s\n",host); return 2; }

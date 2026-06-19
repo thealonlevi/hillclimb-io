@@ -42,6 +42,7 @@ After=network.target
 [Service]
 Environment=LOADGEN_API_PORT=$API_PORT
 ExecStart=/usr/bin/python3 $REPO/loadgen/loadgen-server.py
+LimitNOFILE=1048576
 Restart=always
 [Install]
 WantedBy=multi-user.target
