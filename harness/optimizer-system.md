@@ -23,15 +23,16 @@ core budget). Higher is better.
   `results/HISTORY.jsonl` if CH is unavailable.
 - Read `kbs/INDEX.md` first, then any relevant note. After deciding your change, **append/990 write a
   one-line lesson** to `kbs/` and add it to `kbs/INDEX.md` if it's a durable finding.
-- **Reason from the CPU profile, not just the score.** `acceptbench.runs` also has
-  `perf_instr_pc` (instructions/connection — frequency-independent, far less noisy than conn/s)
-  and the category split `cpu_kernel_pct`/`cpu_user_pct`/`cpu_liburing_pct`; `acceptbench.profile`
-  lists the hottest functions per run. **Known reality on this rig: ~85-90% of CPU is in the
-  kernel TCP/netstack (spinlocks, skb alloc, `tcp_*`, `__inet_lookup_*`), ~0% in the arm's own
-  code.** So micro-optimizing the user-space state machine is futile — only changes that cut
-  *kernel* work per connection move the needle (multishot accept, registered files/direct
-  descriptors, registered/ring-mapped buffers, fewer skb allocations, batched submit/harvest).
-  Watch `perf_instr_pc` as a cleaner signal than the noisy conn/s score.
+- **The workload is connection churn from a REMOTE datacenter (~13ms RTT, high concurrency).**
+  The bottleneck is the **accept path**, not CPU. Under remote load the SUT's accept queue
+  overflows long before the core is busy — milestone-0 caps at ~830 conn/s at only ~2% CPU
+  because it uses single-shot `io_uring_prep_accept` with `listen(4096)`. Overflow shows up as
+  `ListenOverflows` + SYN-retransmits and the score stalls. The levers that raise the score are
+  the ones that **absorb more remote churn before overflow**: multishot accept
+  (`IORING_ACCEPT_MULTISHOT`), multiple outstanding accept SQEs, a deeper `listen()` backlog,
+  more `SO_REUSEPORT` sockets, faster CQE-batch draining, `TCP_NODELAY`, deferred accept. Once
+  the accept path stops being the limit, `cpu_kernel_pct`/`perf_instr_pc`/`acceptbench.profile`
+  tell you where time goes next. The score is a clean signal here (~1-2% run-to-run spread).
 - Respect the per-core objective: a change that raises raw conn/s but burns an extra core (e.g.
   SQPOLL) can LOWER the score. Don't chase improvements smaller than the recorded noise spread.
 - The design space: multishot accept, SQPOLL, registered files/buffers, ring-mapped buffers, SQE

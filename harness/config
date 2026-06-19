@@ -58,3 +58,6 @@ RESULTS_DIR="results"
 HISTORY="results/HISTORY.jsonl"
 BEST="results/BEST.json"
 CH_DB="acceptbench"
+
+# box-specific overrides (gitignored): LOADGEN_URL, TARGET_HOST, etc.
+[ -f harness/config.local ] && . harness/config.local
