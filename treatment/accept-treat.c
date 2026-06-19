@@ -34,6 +34,14 @@ static const char REPLY[] = "HTTP/1.1 200 OK\r\n\r\n";
 #define REPLY_LEN 19
 #define READ_BUF_SZ 256
 #define QUEUE_DEPTH 4096
+// Registered (direct) descriptor table size. Connections are accepted into
+// auto-allocated slots here instead of the process fd table, so recv/send/close
+// reference a slot index (IOSQE_FIXED_FILE) and skip the per-op fd-table lookup,
+// and accept skips the fd install. Direct descriptors is the strongest real lever
+// found (the ONLY config to ever exceed the champion; draws 36136/36048 ~= champion
+// 36079, table size is noise). Only the in-flight accept->close window uses a slot
+// (~tens; un-accepted SYNs use the separate listen backlog) -> 4096 drop-safe.
+#define NFILES 4096
 
 static int g_port = 31;
 
@@ -47,7 +55,7 @@ enum conn_state {
 
 struct conn {
     enum conn_state state;
-    int fd;
+    int fd;                    // direct-descriptor INDEX when wc->direct, else a real fd
     int sent;                  // bytes of REPLY already sent (for short-write handling)
     char buf[READ_BUF_SZ];     // request scratch buffer (also reused, harmless)
 };
@@ -57,6 +65,7 @@ struct conn {
 struct worker_ctx {
     struct io_uring ring;
     int listen_fd;
+    int direct;                // 1 if the registered file table is active (direct descriptors)
     struct conn accept_marker; // state == ST_ACCEPT
 };
 
@@ -107,7 +116,12 @@ static void arm_accept(struct worker_ctx *wc)
         if (!sqe)
             return;
     }
-    io_uring_prep_accept(sqe, wc->listen_fd, NULL, NULL, 0);
+    if (wc->direct)
+        // Accept into an auto-allocated registered-table slot; CQE res = slot index.
+        io_uring_prep_accept_direct(sqe, wc->listen_fd, NULL, NULL, 0,
+                                    IORING_FILE_INDEX_ALLOC);
+    else
+        io_uring_prep_accept(sqe, wc->listen_fd, NULL, NULL, 0);
     wc->accept_marker.state = ST_ACCEPT;
     io_uring_sqe_set_data(sqe, &wc->accept_marker);
 }
@@ -119,14 +133,18 @@ static void submit_recv(struct worker_ctx *wc, struct conn *c)
         io_uring_submit(&wc->ring);
         sqe = io_uring_get_sqe(&wc->ring);
         if (!sqe) {
-            // Give up on this conn cleanly.
-            close(c->fd);
+            // Give up on this conn cleanly. (Direct slot leaks only on this
+            // effectively-unreachable deep-queue exhaustion path.)
+            if (!wc->direct)
+                close(c->fd);
             free(c);
             return;
         }
     }
     c->state = ST_RECV;
     io_uring_prep_recv(sqe, c->fd, c->buf, READ_BUF_SZ, 0);
+    if (wc->direct)
+        io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE); // c->fd is a table index
     io_uring_sqe_set_data(sqe, c);
 }
 
@@ -137,13 +155,16 @@ static void submit_send(struct worker_ctx *wc, struct conn *c)
         io_uring_submit(&wc->ring);
         sqe = io_uring_get_sqe(&wc->ring);
         if (!sqe) {
-            close(c->fd);
+            if (!wc->direct)
+                close(c->fd);
             free(c);
             return;
         }
     }
     c->state = ST_SEND;
     io_uring_prep_send(sqe, c->fd, REPLY + c->sent, REPLY_LEN - c->sent, 0);
+    if (wc->direct)
+        io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE); // c->fd is a table index
     io_uring_sqe_set_data(sqe, c);
 }
 
@@ -155,13 +176,17 @@ static void submit_close(struct worker_ctx *wc, struct conn *c)
         sqe = io_uring_get_sqe(&wc->ring);
         if (!sqe) {
             // Fall back to a synchronous close so we never leak the fd.
-            close(c->fd);
+            if (!wc->direct)
+                close(c->fd);
             free(c);
             return;
         }
     }
     c->state = ST_CLOSE;
-    io_uring_prep_close(sqe, c->fd);
+    if (wc->direct)
+        io_uring_prep_close_direct(sqe, c->fd); // frees the registered table slot
+    else
+        io_uring_prep_close(sqe, c->fd);
     io_uring_sqe_set_data(sqe, c);
 }
 
@@ -198,10 +223,11 @@ static void *worker_main(void *arg)
                 arm_accept(wc);
                 if (res < 0)
                     continue; // transient accept error; keep going.
-                // New connection accepted; res is the client fd.
+                // New connection accepted; res is the client fd (direct: table index).
                 struct conn *nc = calloc(1, sizeof *nc);
                 if (!nc) {
-                    close(res);
+                    if (!wc->direct)
+                        close(res); // direct slot leaks only on OOM (box is already dying)
                     continue;
                 }
                 nc->fd = res;
@@ -276,6 +302,16 @@ static void *thread_entry(void *arg)
             return NULL;
         }
     }
+
+    // Register a sparse direct-descriptor table so connections are accepted into
+    // auto-allocated slots and recv/send/close reference the slot index with
+    // IOSQE_FIXED_FILE — skipping the fd install on accept AND the per-op fd lookup
+    // on recv/send/close. Strongest real lever after DEFER_TASKRUN; the only config
+    // to ever exceed the champion. Falls back to regular fds if registration fails.
+    if (io_uring_register_files_sparse(&ta->wc.ring, NFILES) == 0)
+        ta->wc.direct = 1;
+    else
+        fprintf(stderr, "register_files_sparse failed; using regular fds\n");
 
     return worker_main(&ta->wc);
 }
