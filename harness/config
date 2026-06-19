@@ -1,0 +1,44 @@
+# harness/config — the fixed rules of the game. Sourced by run.sh and the optimizer loop.
+# The optimizer reads these but MUST NOT change them (PROJECT.md). Single-box dev defaults.
+
+# --- core budget / topology -------------------------------------------------
+CORES=4
+SUT_CPUS="2-5"
+LG_CPUS="6-11"
+CH_CPUS="0-1,12"
+
+# --- arms -------------------------------------------------------------------
+CONTROL_PORT=30
+TREAT_PORT=31
+BIND_ADDR="0.0.0.0"          # arms listen here
+TARGET_HOST="127.0.0.1"      # single-box: loadgen connects over loopback (Track B: box-1 IP)
+
+# REPLY_BYTES — 19 bytes, byte-for-byte. The gate validates this exactly.
+REPLY_BYTES=$'HTTP/1.1 200 OK\r\n\r\n'
+
+# --- ceiling / gate thresholds ----------------------------------------------
+QUEUE_HIGH=40                # sustained accept-queue depth (Recv-Q) => backpressure
+DROP_CEILING=0.0001          # < 0.01% connection failures or the step scores 0
+SAMPLE_PCT=5                 # % of connections fully payload-validated by the gate
+
+# --- ramp / timing ----------------------------------------------------------
+RAMP_CONF="harness/ramp.conf"
+WARMUP=10                    # seconds per step before measuring
+MEASURE=30                   # seconds measured per step
+SETTLE=3                     # quiet delay between runs (+ drop_caches)
+N=3                          # repetitions per scored config; score = median
+SMOKE_TIMEOUT=20             # arm must pass a 100-conn smoke test within this many seconds
+
+# --- optimizer loop knobs ---------------------------------------------------
+EPSILON=0.01                 # min fractional improvement to promote a new champion
+PATIENCE=30                  # distinct configs without improvement => plateau => STOP
+K=20                         # treatment runs between control-drift watchdog checks
+CTX_ROTATE_TOKENS=120000     # claude -p session input-token threshold to rotate session
+OPT_MODEL="opus"
+ITER_TIMEOUT=900             # wall-clock cap per claude -p iteration (seconds)
+
+# --- paths ------------------------------------------------------------------
+RESULTS_DIR="results"
+HISTORY="results/HISTORY.jsonl"
+BEST="results/BEST.json"
+CH_DB="acceptbench"

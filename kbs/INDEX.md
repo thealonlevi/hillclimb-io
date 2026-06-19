@@ -5,4 +5,4 @@ full notes on demand. Each note is a single durable lesson learned across iterat
 
 Format: - [slug](slug.md) — one-line takeaway (hypothesis → measured effect on conn/s-per-core)
 
-(empty — the optimizer populates this as it learns)
+- [batched-submit-harvest](batched-submit-harvest.md) — replace per-CQE submit+wait_cqe with one submit_and_wait + peek_batch_cqe drain per loop → fewer io_uring_enter/conn (3.76 → ~1-2 expected)
