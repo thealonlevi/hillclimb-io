@@ -29,12 +29,13 @@ SAMPLE_PCT=5                 # % of connections fully payload-validated by the g
 # --- ramp / timing ----------------------------------------------------------
 RAMP_CONF="harness/ramp.conf"
 LG_THREADS="auto"            # loadgen worker threads; "auto" = the load-generator's core count
-# adaptive ramp: auto-scale offered load until the SUT tops out (no hand-tuned rates).
-RAMP_MODE="adaptive"         # adaptive | fixed (fixed steps through harness/ramp.conf)
-RAMP_START=5000              # first offered rate (conn/s)
-RAMP_GROWTH=1.5              # multiply offered rate each step
-RAMP_MAX=2000000             # safety cap on offered rate
-PLATEAU_GAIN=0.03            # stop if completed grows <3% despite higher offered (can't go higher)
+# adaptive ramp: auto-scale CONCURRENCY (in-flight connections, closed-loop) until the SUT tops
+# out — no hand-tuned rates, and it can't congestion-collapse over a high-latency link.
+RAMP_MODE="adaptive"         # adaptive (scale concurrency) | fixed (offered rates from ramp.conf)
+CONN_START=32                # first in-flight connection count
+CONN_GROWTH=2                # double in-flight each step
+CONN_MAX=200000              # safety cap on in-flight connections
+PLATEAU_GAIN=0.03            # stop if completed grows <3% despite more concurrency (SUT is the limit)
 WARMUP=10                    # seconds per step before measuring
 MEASURE=30                   # seconds measured per step
 SETTLE=3                     # quiet delay between runs (+ drop_caches)

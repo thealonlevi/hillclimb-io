@@ -35,14 +35,16 @@ def run_loadgen(q):
     host = g("host", "127.0.0.1")
     port = int(g("port", "31"))
     rate = float(g("rate", "1000"))
+    conns = int(g("conns", "0"))          # >0 => closed-loop concurrency mode
     dur = min(float(g("duration", "5")), MAX_DURATION)
     threads = int(g("threads", "8"))
     sample = int(g("sample_pct", "5"))
     # basic sanity to avoid abuse
     if not host.replace(".", "").replace(":", "").replace("-", "").isalnum():
         raise ValueError("bad host")
-    cmd = [LOADGEN, "--host", host, "--port", str(port), "--rate", str(rate),
+    cmd = [LOADGEN, "--host", host, "--port", str(port),
            "--duration", str(dur), "--threads", str(threads), "--sample-pct", str(sample)]
+    cmd += (["--conns", str(conns)] if conns > 0 else ["--rate", str(rate)])
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=dur + 30)
     if out.returncode != 0:
         return {"error": "loadgen failed", "stderr": out.stderr[:400], "cmd": " ".join(map(shlex.quote, cmd))}

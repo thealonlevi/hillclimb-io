@@ -64,18 +64,20 @@ trap 'stop_arm' EXIT
 cpu_usec(){ awk '/usage_usec/{print $2}' "$SUTCG/cpu.stat" 2>/dev/null; }
 max_recvq(){ ss -ltnH "sport = :$PORT" 2>/dev/null | awk '{if($2>m)m=$2}END{print m+0}'; }
 
-# loadgen_run <rate> <duration> <threads> <sample_pct> -> prints loadgen JSON.
-# Remote (box 2) when LOADGEN_URL is set; else local subprocess (single-box dev). In remote mode
-# TARGET_HOST must be box 1's address as reachable from box 2 (set it in harness/config).
+# loadgen_run <kind:rate|conns> <level> <duration> <threads> <sample_pct> -> prints loadgen JSON.
+#   rate  = open-loop offered conn/s (fine on sub-ms links)
+#   conns = closed-loop in-flight connections (correct over latency: throughput = conns/latency,
+#           and a slow/distant SUT can't be overloaded into congestion collapse)
+# Remote (box 2) when LOADGEN_URL is set; else local. TARGET_HOST must be box 1 as seen from box 2.
 loadgen_run(){
-  local rate="$1" dur="$2" th="$3" sp="$4"
+  local kind="$1" level="$2" dur="$3" th="$4" sp="$5"
   if [ -n "${LOADGEN_URL:-}" ]; then
     curl -fsS --max-time $((dur+30)) -G "$LOADGEN_URL/run" \
       --data-urlencode "host=$TARGET_HOST" --data-urlencode "port=$PORT" \
-      --data-urlencode "rate=$rate"        --data-urlencode "duration=$dur" \
+      --data-urlencode "$kind=$level"      --data-urlencode "duration=$dur" \
       --data-urlencode "threads=$th"       --data-urlencode "sample_pct=$sp" 2>/dev/null
   else
-    loadgen/loadgen --host "$TARGET_HOST" --port "$PORT" --rate "$rate" --duration "$dur" \
+    loadgen/loadgen --host "$TARGET_HOST" --port "$PORT" "--$kind" "$level" --duration "$dur" \
       --threads "$th" --sample-pct "$sp"
   fi
 }
@@ -85,7 +87,7 @@ smoke(){
   local t0=$SECONDS
   while [ $((SECONDS-t0)) -lt "$SMOKE_TIMEOUT" ]; do
     ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q . && {
-      local out; out=$(loadgen_run 200 1 2 100)
+      local out; out=$(loadgen_run rate 200 1 2 100)
       echo "$out" | grep -q '"reply_ok":true' && [ "$(echo "$out"|sed 's/.*"completed":\([0-9]*\).*/\1/')" -ge 100 ] && return 0
     }
     sleep 0.5
@@ -97,13 +99,13 @@ smoke(){
 # measure_step <rate> <idx> <do_sample>: one warmup+measure window. Appends the step JSON (and
 # per-second samples when do_sample), and returns metrics via globals M_COMP/M_CPU/M_RECVQ/M_DROP/M_GATE.
 measure_step(){
-  local RATE="$1" idx="$2" do_sample="$3"
-  loadgen_run "$RATE" "$WARMUP" "$LG_THREADS" "$SAMPLE_PCT" >/dev/null 2>&1   # warmup
+  local kind="$1" RATE="$2" idx="$3" do_sample="$4"
+  loadgen_run "$kind" "$RATE" "$WARMUP" "$LG_THREADS" "$SAMPLE_PCT" >/dev/null 2>&1   # warmup
   local u0 u1 wall mq res samp="$RUNDIR/.samp"
   u0=$(cpu_usec); local s0=$SECONDS; : > "$samp"
   ( for ((i=1;i<=MEASURE;i++)); do sleep 1; printf '%d %s %s\n' "$i" "$(cpu_usec)" "$(max_recvq)"; done ) > "$samp" &
   local sp=$!
-  res=$(loadgen_run "$RATE" "$MEASURE" "$LG_THREADS" "$SAMPLE_PCT")
+  res=$(loadgen_run "$kind" "$RATE" "$MEASURE" "$LG_THREADS" "$SAMPLE_PCT")
   wait "$sp" 2>/dev/null
   u1=$(cpu_usec); wall=$(( (SECONDS-s0>0?SECONDS-s0:1) ))
   mq=$(awk '{print $3}' "$samp" | sort -n | tail -1); mq=${mq:-0}
@@ -123,7 +125,7 @@ measure_step(){
     "$idx" "$RATE" "${comp:-0}" "${drop:-1}" "${ok:-false}" "$cpuutil" "${mq:-0}" "${p99:-0}" "${p999:-0}" "${maxms:-0}" >> "$STEPFILE"
   local gate_ok=1; [ "$ok" = "true" ] || gate_ok=0
   awk -v d="${drop:-1}" -v c="$DROP_CEILING" 'BEGIN{exit !(d<c)}' || gate_ok=0
-  log "  step $idx: offered=$RATE completed=${comp:-0}/s drop=${drop} reply_ok=${ok} cpu=${cpuutil} recvq=${mq} gate=$gate_ok"
+  log "  step $idx: $kind=$RATE completed=${comp:-0}/s drop=${drop} reply_ok=${ok} cpu=${cpuutil} recvq=${mq} gate=$gate_ok"
   M_COMP=${comp:-0}; M_CPU=$cpuutil; M_RECVQ=${mq:-0}; M_DROP=${drop:-1}; M_GATE=$gate_ok
 }
 
@@ -141,21 +143,24 @@ run_ramp(){
     awk -v u="$M_CPU" 'BEGIN{exit !(u>0.98)}' && { reason="cpu_saturation"; log "  -> cpu saturated, ceiling"; return 0; }
     return 1
   }
+  CEIL_CONNS="${CONN_START:-32}"   # in-flight level that achieved `best` (for the profiling passes)
   if [ "${RAMP_MODE:-adaptive}" = adaptive ]; then
-    local rate="${RAMP_START:-5000}" prev=0
-    while [ "$rate" -le "${RAMP_MAX:-2000000}" ]; do
-      measure_step "$rate" "$idx" "$do_sample"
+    # scale CONCURRENCY (in-flight connections), not offered rate: closed-loop can't congestion-collapse
+    local conns="${CONN_START:-32}" prev=0
+    while [ "$conns" -le "${CONN_MAX:-200000}" ]; do
+      measure_step conns "$conns" "$idx" "$do_sample"
+      [ "$M_GATE" -ne 0 ] && awk -v c="$M_COMP" -v b="$best" 'BEGIN{exit !(c>b)}' && CEIL_CONNS="$conns"
       ceiling_hit && break
-      # throughput plateau: completed grew < PLATEAU_GAIN despite offered growing -> can't go higher
+      # throughput plateau: completed grew < PLATEAU_GAIN despite more concurrency -> SUT is the limit
       if [ "$idx" -gt 0 ] && awk -v c="$M_COMP" -v p="$prev" -v g="${PLATEAU_GAIN:-0.03}" 'BEGIN{exit !(c<=p*(1+g))}'; then
         reason="throughput_plateau"; log "  -> completed plateau ($M_COMP vs $prev), ceiling"; break; fi
       prev="$M_COMP"; idx=$((idx+1))
-      rate=$(awk -v r="$rate" -v g="${RAMP_GROWTH:-1.5}" 'BEGIN{printf "%d", r*g}')
+      conns=$(awk -v r="$conns" -v g="${CONN_GROWTH:-2}" 'BEGIN{printf "%d", r*g}')
     done
   else
     while read -r RATE; do
       [[ "$RATE" =~ ^[0-9]+$ ]] || continue
-      measure_step "$RATE" "$idx" "$do_sample"
+      measure_step rate "$RATE" "$idx" "$do_sample"
       ceiling_hit && break
       idx=$((idx+1))
     done < "$RAMP_CONF"
@@ -165,11 +170,11 @@ run_ramp(){
 
 # ---- 4. syscall profile (best-effort analytics, not gated) ----------------
 profile_syscalls(){   # writes $1 with per-conn counts
-  local out="$1"; local rate=5000
+  local out="$1"
   command -v strace >/dev/null || { echo '{}' > "$out"; return; }
   ( strace -f -c -p "$ARM_PID" -o "$RUNDIR/strace.txt" 2>/dev/null ) &
   local sp=$!
-  local res; res=$(loadgen_run "$rate" 3 4 0)
+  local res; res=$(loadgen_run conns "${CEIL_CONNS:-256}" 3 "$LG_THREADS" 0)
   kill -INT "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
   local comp; comp=$(echo "$res" | sed 's/.*"completed":\([0-9]*\).*/\1/'); [ "${comp:-0}" -lt 1 ] && comp=1
   awk -v C="$comp" '
@@ -189,7 +194,7 @@ perf_pass(){   # writes {"ipc":..,"instr_pc":..} to $1
   perf stat -e instructions,cycles,context-switches,cpu-migrations -p "$ARM_PID" \
     -o "$RUNDIR/perf.txt" -- sleep 3 2>/dev/null &
   local pp=$!
-  local res; res=$(loadgen_run 5000 3 4 0)
+  local res; res=$(loadgen_run conns "${CEIL_CONNS:-256}" 3 "$LG_THREADS" 0)
   wait "$pp" 2>/dev/null
   local comp; comp=$(echo "$res" | sed 's/.*"completed":\([0-9]*\).*/\1/'); [ "${comp:-0}" -lt 1 ] && comp=1
   RUNDIR="$RUNDIR" COMP="$comp" OUT="$out" python3 <<'PY'
@@ -214,7 +219,7 @@ profile_functions(){   # writes {kernel_pct,user_pct,liburing_pct,libc_pct,top:[
   command -v perf >/dev/null || { echo '{}' > "$out"; return; }
   perf record -e cpu-clock -F 997 -p "$ARM_PID" -o "$RUNDIR/perf-fn.data" -- sleep 4 2>/dev/null &
   local rp=$!
-  loadgen_run 40000 4 "${LG_THREADS:-10}" 0 >/dev/null 2>&1
+  loadgen_run conns "${CEIL_CONNS:-256}" 4 "$LG_THREADS" 0 >/dev/null 2>&1
   wait "$rp" 2>/dev/null
   perf report -i "$RUNDIR/perf-fn.data" --stdio --percent-limit 0.1 2>/dev/null > "$RUNDIR/perf-fn.txt" || true
   ARM_COMM="$(basename "$BIN")" FN="$RUNDIR/perf-fn.txt" OUT="$out" python3 <<'PY'

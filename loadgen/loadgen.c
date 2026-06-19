@@ -55,7 +55,8 @@ typedef struct {
     int      id, nthreads;
     char     host[64];
     int      port;
-    double   rate;           // this thread's share, conn/s
+    double   rate;           // this thread's share, conn/s (open-loop / rate mode)
+    int      conns;          // this thread's target in-flight (closed-loop / concurrency mode; >0 wins)
     double   duration;       // seconds
     int      sample_pct;
     // results
@@ -151,18 +152,26 @@ static void *worker_main(void *arg){
     struct epoll_event evs[1024];
     int inflight=0;
     double start=now_s(), tend=start+w->duration;
-    double interval = w->rate>0 ? 1.0/w->rate : 1e9;   // seconds between starts
+    double interval = w->rate>0 ? 1.0/w->rate : 1e9;   // seconds between starts (rate mode)
     double next_start = start;
     double drain_deadline = tend + 5.0;   // hard wall: never drain longer than 5s past tend
+    int target = w->conns;                // >0 => closed-loop concurrency mode
+    int cap = target>0 ? target : MAX_INFLIGHT;
     while(1){
         double t=now_s();
         if(t>=tend && inflight==0) break;
         if(t>=drain_deadline){ w->failed[F_TIMEOUT]+=inflight; break; }  // stragglers => timeouts
-        // launch due connections (paced), unless past duration or at inflight cap
-        while(t<tend && t>=next_start && inflight<MAX_INFLIGHT){
-            conn_t *c=NULL; if(conn_start(w,ep,&c)==0) inflight++;
-            next_start += interval;
-            if(next_start < t) next_start = t;  // don't build unbounded backlog
+        if(target>0){
+            // CLOSED-LOOP: keep exactly `target` connections in flight; refill as they complete.
+            // throughput self-limits to target/latency, so a slow/distant SUT can't be overloaded.
+            while(t<tend && inflight<cap){ conn_t *c=NULL; if(conn_start(w,ep,&c)==0) inflight++; else break; }
+        } else {
+            // OPEN-LOOP: launch at the paced offered rate (good on sub-ms links).
+            while(t<tend && t>=next_start && inflight<cap){
+                conn_t *c=NULL; if(conn_start(w,ep,&c)==0) inflight++;
+                next_start += interval;
+                if(next_start < t) next_start = t;  // don't build unbounded backlog
+            }
         }
         int n=epoll_wait(ep,evs,1024,1 /*ms*/);
         for(int i=0;i<n;i++){
@@ -175,16 +184,18 @@ static void *worker_main(void *arg){
 }
 
 int main(int argc,char**argv){
-    const char *host="127.0.0.1"; int port=31; double rate=1000, dur=5; int threads=4, sample=5;
+    const char *host="127.0.0.1"; int port=31; double rate=1000, dur=5; int threads=4, sample=5, conns=0;
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--host")&&i+1<argc) host=argv[++i];
         else if(!strcmp(argv[i],"--port")&&i+1<argc) port=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--rate")&&i+1<argc) rate=atof(argv[++i]);
+        else if(!strcmp(argv[i],"--conns")&&i+1<argc) conns=atoi(argv[++i]);   // closed-loop in-flight target
         else if(!strcmp(argv[i],"--duration")&&i+1<argc) dur=atof(argv[++i]);
         else if(!strcmp(argv[i],"--threads")&&i+1<argc) threads=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--sample-pct")&&i+1<argc) sample=atoi(argv[++i]);
     }
     if(threads<1)threads=1;
+    if(conns>0 && threads>conns) threads=conns;   // don't spawn more threads than target connections
     // raise the open-fd limit: high-latency links need many concurrent connections in flight
     // (throughput = concurrency / latency); the default 1024 causes socket() EMFILE storms.
     { struct rlimit rl; rl.rlim_cur=rl.rlim_max=1048576;
@@ -198,6 +209,7 @@ int main(int argc,char**argv){
     pthread_t *th=calloc(threads,sizeof *th);
     for(int i=0;i<threads;i++){
         ws[i].id=i; ws[i].nthreads=threads; ws[i].port=port; ws[i].rate=rate/threads;
+        ws[i].conns = conns>0 ? (conns/threads + (i < conns%threads ? 1 : 0)) : 0;
         ws[i].duration=dur; ws[i].sample_pct=sample;
         pthread_create(&th[i],NULL,worker_main,&ws[i]);
     }
