@@ -8,6 +8,7 @@ cd "$(dirname "$0")/.."
 ROOT="$PWD"
 export PATH="$PATH:/usr/local/go/bin"
 . harness/config
+export GOMAXPROCS="$CORES"   # control arm (Go) honors the pinned core budget (spec: GOMAXPROCS==CORES)
 
 ARM="${1:?usage: run.sh <treatment|control-frozen|control-adaptive>}"
 WARMUP="${WARMUP_OVERRIDE:-$WARMUP}"
@@ -76,13 +77,13 @@ run_ramp(){   # echoes: <max_sustained_conn_s> <ceiling_reason> ; writes per-ste
     [[ "$RATE" =~ ^[0-9]+$ ]] || continue
     # warmup
     loadgen/loadgen --host "$TARGET_HOST" --port "$PORT" --rate "$RATE" --duration "$WARMUP" \
-       --threads 6 --sample-pct "$SAMPLE_PCT" >/dev/null 2>&1
+       --threads "${LG_THREADS:-8}" --sample-pct "$SAMPLE_PCT" >/dev/null 2>&1
     # measure (sample cpu + recvq around it)
     local u0 u1 wall mq res
     u0=$(cpu_usec); local s0=$SECONDS
     mq=$( ( for i in $(seq 1 "$MEASURE"); do max_recvq; sleep 1; done ) | sort -n | tail -1 )
     res=$(loadgen/loadgen --host "$TARGET_HOST" --port "$PORT" --rate "$RATE" --duration "$MEASURE" \
-       --threads 6 --sample-pct "$SAMPLE_PCT")
+       --threads "${LG_THREADS:-8}" --sample-pct "$SAMPLE_PCT")
     u1=$(cpu_usec); wall=$(( (SECONDS-s0>0?SECONDS-s0:1) ))
     local comp drop ok p99
     comp=$(echo "$res" | sed 's/.*"completed_cps":\([0-9.]*\).*/\1/')

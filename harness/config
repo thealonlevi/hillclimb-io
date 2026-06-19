@@ -2,8 +2,8 @@
 # The optimizer reads these but MUST NOT change them (PROJECT.md). Single-box dev defaults.
 
 # --- core budget / topology -------------------------------------------------
-CORES=4
-SUT_CPUS="2-5"
+CORES=1
+SUT_CPUS="2"
 LG_CPUS="6-11"
 CH_CPUS="0-1,12"
 
@@ -23,6 +23,7 @@ SAMPLE_PCT=5                 # % of connections fully payload-validated by the g
 
 # --- ramp / timing ----------------------------------------------------------
 RAMP_CONF="harness/ramp.conf"
+LG_THREADS=10                # loadgen worker threads (must out-supply the SUT to find its ceiling)
 WARMUP=10                    # seconds per step before measuring
 MEASURE=30                   # seconds measured per step
 SETTLE=3                     # quiet delay between runs (+ drop_caches)
